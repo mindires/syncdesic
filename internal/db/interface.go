@@ -73,6 +73,11 @@ type DB interface {
 	AllNeededGlobalFiles(folder string, device protocol.DeviceID, order config.PullOrder, limit, offset int) (iter.Seq[protocol.FileInfo], func() error)
 	AllLocalBlocksWithHash(folder string, hash []byte) (iter.Seq[BlockMapEntry], func() error)
 
+	// AllNeededBlockHashes returns distinct blocklist hashes that are needed
+	// locally, grouped with their associated file names. This is the
+	// content-addressed alternative to AllNeededGlobalFiles.
+	AllNeededBlockHashes(folder string, device protocol.DeviceID, order config.PullOrder, limit, offset int) (iter.Seq[NeededBlockHash], func() error)
+
 	// Block index management
 	DropBlockIndex(folder string) error
 	PopulateBlockIndex(folder string) error
@@ -128,6 +133,14 @@ type BlockMapEntry struct {
 type KeyValue struct {
 	Key   string
 	Value []byte
+}
+
+// NeededBlockHash groups file names that share the same blocklist hash.
+// This is the core unit for block-first puller iteration: instead of
+// iterating per-file then re-querying per-path, we iterate per-blocklist-hash.
+type NeededBlockHash struct {
+	Hash  []byte
+	Names []string
 }
 
 type FileMetadata struct {
