@@ -59,10 +59,27 @@ syncdesic/
 
 ## 构建与测试
 
-```powershell
-# 构建
-go build ./...
+### 开发构建（无 web UI，快速迭代）
 
+```powershell
+go build ./...
+```
+
+### 生产构建（含 web UI 和版本信息）
+
+```powershell
+# 默认（纯 Go modernc/sqlite，无外部依赖）
+go run build.go build syncthing
+
+# Windows 推荐（mattn/go-sqlite3 CGo 后端，避免 modernc/libc 无控制台崩溃）
+go run build.go build syncthing -tags "mattn"
+```
+
+> **Windows 已知问题**：`modernc.org/sqlite` 在无控制台环境（如 Tray 启动）下会 panic `"no console"`。解决方案是使用 `-tags "mattn"` 的 CGo 构建。需要安装 `gcc`（TDM-GCC/MinGW-w64）及 `pkg-config`。
+
+### 测试
+
+```powershell
 # 测试指定包
 go test ./lib/model/... -v -count=1
 

@@ -15,13 +15,16 @@ import (
 	"iter"
 	"slices"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
 	"github.com/syncthing/syncthing/internal/db"
+	"github.com/syncthing/syncthing/internal/gen/dbproto"
 	"github.com/syncthing/syncthing/internal/itererr"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 func (s *folderDB) GetDeviceFile(device protocol.DeviceID, file string) (protocol.FileInfo, bool, error) {
@@ -107,6 +110,47 @@ func (s *folderDB) AllLocalBlocksWithHash(hash []byte) (iter.Seq[db.BlockMapEntr
 	var h [32]byte
 	copy(h[:], hash)
 	locs, ok := s.blockCache.get(h)
+	if ok {
+		return slices.Values(locs), func() error { return nil }
+	}
+
+	// Cache miss: warm the entire cache from blocklists protobuf
+	rows, err := s.sql.Queryx(`
+		SELECT bl.blprotobuf, n.name, f.blocklist_hash FROM files f
+		INNER JOIN blocklists bl ON bl.blocklist_hash = f.blocklist_hash
+		INNER JOIN file_names n ON f.name_idx = n.idx
+		WHERE f.device_idx = ? AND f.blocklist_hash IS NOT NULL
+	`, s.localDeviceIdx)
+	if err != nil {
+		return func(yield func(db.BlockMapEntry) bool) {}, func() error { return err }
+	}
+
+	var seenBlocklists sync.Map
+	for rows.Next() {
+		var blProtobuf []byte
+		var name string
+		var blocklistHash []byte
+		if err := rows.Scan(&blProtobuf, &name, &blocklistHash); err != nil {
+			rows.Close()
+			return func(yield func(db.BlockMapEntry) bool) {}, func() error { return err }
+		}
+		if _, loaded := seenBlocklists.LoadOrStore(string(blocklistHash), struct{}{}); loaded {
+			continue
+		}
+		var bl dbproto.BlockList
+		if err := proto.Unmarshal(blProtobuf, &bl); err != nil {
+			continue
+		}
+		blocks := make([]protocol.BlockInfo, len(bl.Blocks))
+		for i, b := range bl.Blocks {
+			blocks[i] = protocol.BlockInfoFromWire(b)
+		}
+		s.blockCache.notify(name, blocklistHash, blocks)
+	}
+	rows.Close()
+
+	// Retry from cache — guaranteed to hit after full warm-up
+	locs, ok = s.blockCache.get(h)
 	if !ok {
 		return func(yield func(db.BlockMapEntry) bool) {}, func() error { return nil }
 	}

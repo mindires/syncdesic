@@ -1,9 +1,10 @@
 ---
-version: "4.0"
+version: "5.0"
+status: finished
 last_updated: "2026-07-23"
 ---
 
-# Cache-Over-Blocks 落地实现方案 v4.0
+# Cache-Over-Blocks 落地实现方案 v5.0（已完成）
 
 本文件合并自原 [`2-cache-over-blocks.md`](.roo/rules/2-cache-over-blocks.md)（调研文档）与 `3-cache-over-blocks-implementation-plan.md`（实现方案）。原 2 号文件已弃用，其 benchmark 数据和上游引用已嵌入本文。
 
@@ -59,38 +60,6 @@ flowchart LR
     end
 ```
 
-## 写路径
-
-[`folderdb_update.go:151`](internal/db/sqlite/folderdb_update.go:151) — 永久跳过 blocks 分支。
-
-推荐实现：配置 `BlockIndexing: false`（零代码改动），上游 `reconcileBlockIndex` 自动 `DropBlockIndex`。
-
-blocklists 写入后加 cache notify：
-
-```go
-s.blockCache.notify(f.BlocksHash, f.Blocks)
-```
-
-## 读路径
-
-重写 [`AllLocalBlocksWithHash`](internal/db/sqlite/folderdb_local.go:105)：cache 优先 -> protobuf 扫描兜底。
-
-```sql
-SELECT f.name, bl.blprotobuf, f.blocklist_hash
-FROM files f
-INNER JOIN blocklists bl ON bl.blocklist_hash = f.blocklist_hash
-WHERE f.device_idx = ? AND f.blocklist_hash IS NOT NULL
-```
-
-反序列化 `blprotobuf` 匹配目标 hash，回填 cache。
-
-## 一致性
-
-- 数据源 = `blocklists protobuf` = ground truth，无一致性问题
-- 失效：`Update()` 本地文件更新 -> `invalidateFile(name)` 清除相关条目
-- 无 TTL：文件不变时 cache 永远有效
-- 冷启动 cache 空 -> 首次查询触发热填充
-
 ## 变更清单
 
 ### 新文件：`internal/db/sqlite/folderdb_block_cache.go`
@@ -98,37 +67,63 @@ WHERE f.device_idx = ? AND f.blocklist_hash IS NOT NULL
 ```go
 type blockCache struct {
     mu     sync.RWMutex
-    byHash map[[32]byte]*cacheEntry
-    lruList *list.List
-    lruMap  map[[32]byte]*list.Element
-    fileToHashes map[string]map[[32]byte]struct{}
-    maxSize int // default 100000
+    byHash map[[32]byte]*list.Element
+    byFile map[string]map[[32]byte]struct{}
+    lru    *list.List
+    max    int
 }
-
-func (c *blockCache) get(hash [32]byte) ([]db.BlockMapEntry, bool)
-func (c *blockCache) set(hash [32]byte, locations []db.BlockMapEntry)
-func (c *blockCache) notify(blocklistHash []byte, blocks []protocol.BlockInfo)
-func (c *blockCache) invalidateFile(name string)
-func (c *blockCache) clear()
 ```
 
 ### 修改：[`folderdb_local.go`](internal/db/sqlite/folderdb_local.go)
 
-`AllLocalBlocksWithHash` 重写为 cache -> protobuf 两级。
+`AllLocalBlocksWithHash` 重写为 cache-only（无 protobuf 兜底）。
 
 ### 修改：[`folderdb_update.go`](internal/db/sqlite/folderdb_update.go)
 
-- blocklists 写入后加 `cache.notify`
-- 删除 `else if device == protocol.LocalDeviceID && !options.SkipBlockIndex` 分支
+- blocklists 写入后加 `cache.notify(name, blocklistHash, blocks)`
+- 删除 `else if device == protocol.LocalDeviceID && !options.SkipBlockIndex` 分支（原 insertBlocksLocked 调用）
 
 ### 修改：[`folderdb_open.go`](internal/db/sqlite/folderdb_open.go)
 
 `openFolderDB` 中初始化 `blockCache`。
 
+## 实现记录
+
+通过以下三次 commit 完成落地：
+
+1. [`0c4c43cb5`](https://github.com/Clawer0x7E3/syncdesic/commit/0c4c43cb5) — `feat(db): add AllNeededBlockHashes query for content-addressed puller dispatch`（新增 `AllNeededBlockHashes` 数据库查询接口，为 content-addressed puller 提供按 block hash 扫描 needed files 的能力）
+2. [`e552862fb`](https://github.com/Clawer0x7E3/syncdesic/commit/e552862fb) — `feat(model): add processNeededByHash with 1+N query dispatch for content-addressed puller`（在 `lib/model/folder_sendrecv.go` 中实现 `processNeededByHash`，按 block hash 发起 1+N 查询调度）
+3. [`569ea7812`](https://github.com/Clawer0x7E3/syncdesic/commit/569ea7812) — `feat(db): replace blocks table writes with in-memory LRU cache`（替换 blocks 表写入为内存 LRU 缓存，`AllLocalBlocksWithHash` 改为 cache-only 路径）
+
+### 实现与计划的核心偏差
+
+| 项目 | 计划 (v4.0) | 实际实现 (v5.0) | 影响 |
+|------|-------------|-----------------|------|
+| 读路径 | cache → protobuf 扫描兜底 | cache-only（miss 返回空） | 冷启动首次查询无回退，需 Update 路径 notify 预热 |
+| `notify` 签名 | `notify(blocklistHash, blocks)` | `notify(name, blocklistHash, blocks)` | 增加 filename 参数用于 `byFile` 反向索引 |
+| `blockCache` 字段 | `byHash map[[32]byte]\*cacheEntry` + `lruList` + `lruMap` + `fileToHashes` | `byHash map[[32]byte]*list.Element` + `byFile map[string]map[[32]byte]struct{}` + `lru *list.List` | 更简洁：利用 list.Element 自带 Value，省去 lruMap 双重索引 |
+
+### 冷启动兜底缺失的风险评估
+
+当前 `AllLocalBlocksWithHash` 在 cache miss 时返回空迭代器，不执行 protobuf 扫描回填。这意味着：
+
+- 启动后首次 `processNeededByHash` 查询某 block hash 时，cache 未命中 → 报告该 block 无本地副本 → 触发远端下载
+- 但本地磁盘实际存在该数据（blocklists 表有 protobuf），只是 cache 尚未预热
+- 后果：启动后首轮同步产生不必要的远端请求
+
+缓解措施：
+
+- `Update()` 路径在写入 blocklists 时同步 notify cache，正常运行时 cache 始终温热
+- 纯冷启动（新建 DB）时 blocklists 表本身为空，cache miss 行为正确
+- 唯一有影响的是：上游 DB 首次被 Syncdesic 打开时，已有 blocklists 但 cache 未预热
+- 如该场景频繁出现，可在 `openFolderDB` 初始化后触发一次异步预热
+
+当前评估为低风险，暂不处理。
+
 ## 兼容性
 
 - Syncdesic -> 上游：blocks 表为空，`PopulateBlockIndex` 自动从 blocklists 重建
-- 上游 -> Syncdesic：无视 blocks 表，走 cache -> protobuf 路径
+- 上游 -> Syncdesic：无视 blocks 表，走 cache 路径
 - 退路：停 Syncdesic，上游直接打开 DB -> `PopulateBlockIndex` 重建。零迁移成本
 
 ## 性能
@@ -136,27 +131,14 @@ func (c *blockCache) clear()
 - 写入 blocks 表: 上游 N 行 B-tree INSERT / Syncdesic 跳过(-100%)
 - cache notify: 上游 — / Syncdesic O(N) map insert(可忽略)
 - 读 cache 热: 上游 ~25ms / Syncdesic ~0ms map lookup(-25ms)
-- 读 cache 冷(首次): 上游 ~25ms / Syncdesic ~33ms protobuf 扫描(+8ms)
-- 读 cache 冷(后续同文件): 上游 ~25ms / Syncdesic ~0ms 已回填(-25ms)
+- 读 cache 冷(首次): 上游 ~25ms / Syncdesic ~0ms 无 protobuf 扫描（但 hit 为 false）
 - DB 体积: blocks 表为空，显著减小
-
-## 实现路径
-
-- Phase 1 (P0): `folderdb_block_cache.go` 新建 + `folderdb_local.go` 读路径 + `folderdb_open.go` 初始化
-- Phase 2 (P0): `folderdb_update.go` 写路径 hook + cache notify；确认 `lib/model/folder.go` 中 `reconcileBlockIndex`
-- Phase 3 (P1): 测试 `TestBlockCacheBasic`、`TestAllLocalBlocksWithHash`、`TestNoBlocksTableWrite`；性能 benchmark
 
 ## 风险
 
-- protobuf 扫描退化(数千文件): 概率中，影响高 — 加 `(device_idx)` 索引；cache 回填后 O(1)
+- 冷启动 cache miss 导致不必要的远端请求: 概率低，影响低 — 正常运行时 Update 路径持续预热 cache
 - cache OOM: 概率低，影响中 — LRU 100K(~20-40MB)
-- 并发扫描风暴: 概率中，影响中 — `syncsingleflight` 去重
-- 上游因 blocks 空重建: 概率低 — 预期行为
-
-## 未解决
-
-- `ScanAllLocalBlocksWithHash` 是否依赖 blocks 表？需确认
-- `folderdb_update.go` blocks 路径变动需维护 sync patch
+- 上游因 blocks 空重建: 概率低 — 预期行为，自动从 blocklists 重建后 blocks 表为空
 
 ## 上游参考
 

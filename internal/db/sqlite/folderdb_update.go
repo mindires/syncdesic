@@ -383,32 +383,6 @@ func (s *folderDB) PopulateBlockIndex() error {
 	return nil
 }
 
-func (*folderDB) insertBlocksLocked(tx *txPreparedStmts, blocklistHash []byte, blocks []protocol.BlockInfo) error {
-	if len(blocks) == 0 {
-		return nil
-	}
-	bs := make([]map[string]any, len(blocks))
-	for i, b := range blocks {
-		bs[i] = map[string]any{
-			"hash":           b.Hash,
-			"blocklist_hash": blocklistHash,
-			"idx":            i,
-			"offset":         b.Offset,
-			"size":           b.Size,
-		}
-	}
-
-	for chunk := range slices.Chunk(bs, 1000) {
-		if _, err := tx.NamedExec(`
-			INSERT OR IGNORE INTO blocks (hash, blocklist_hash, idx, offset, size)
-			VALUES (:hash, :blocklist_hash, :idx, :offset, :size)
-		`, chunk); err != nil {
-			return wrap(err)
-		}
-	}
-
-	return nil
-}
 func (s *folderDB) recalcGlobalForFolder(txp *txPreparedStmts) error {
 	// Select files where there is no global, those are the ones we need to
 	// recalculate.

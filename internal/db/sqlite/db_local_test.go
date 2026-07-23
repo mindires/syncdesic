@@ -166,18 +166,18 @@ func TestDropBlockIndex(t *testing.T) {
 		t.Fatal("expected block hits before drop")
 	}
 
-	// Drop the block index
+	// Drop the block index (clears in-memory cache + blocks table)
 	if err := sdb.DropBlockIndex(folderID); err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify blocks are gone
+	// Blocks are still findable via protobuf scan fallback
 	hits, err = itererr.Collect(sdb.AllLocalBlocksWithHash(folderID, files[0].Blocks[0].Hash))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hits) != 0 {
-		t.Fatal("expected no block hits after drop")
+	if len(hits) == 0 {
+		t.Fatal("expected block hits from protobuf scan after drop")
 	}
 
 	// Dropping again should be a no-op (already empty)
@@ -309,13 +309,14 @@ func TestSkipBlockIndexOnUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Blocks should not be indexed
+	// Blocks should be found via protobuf scan fallback even with SkipBlockIndex
+	// (blocklists table is still written, only blocks table is skipped)
 	hits, err := itererr.Collect(sdb.AllLocalBlocksWithHash(folderID, file.Blocks[0].Hash))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hits) != 0 {
-		t.Fatal("expected no block hits with SkipBlockIndex")
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit from protobuf scan, got %d", len(hits))
 	}
 
 	// The blocklist should still be stored (file info is retrievable with blocks)
@@ -335,12 +336,13 @@ func TestSkipBlockIndexOnUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// After populate, result via cache should be identical to protobuf scan
 	hits, err = itererr.Collect(sdb.AllLocalBlocksWithHash(folderID, file.Blocks[0].Hash))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(hits) != 1 {
-		t.Fatal("expected one hit after populate")
+		t.Fatalf("expected 1 hit after populate (each block has unique hash), got %d", len(hits))
 	}
 }
 

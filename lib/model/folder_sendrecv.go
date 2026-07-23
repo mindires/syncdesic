@@ -411,7 +411,7 @@ func (f *sendReceiveFolder) pullerIteration(ctx context.Context, scanChan chan<-
 		f.finisherRoutine(ctx, finisherChan, dbUpdateChan, scanChan)
 	})
 
-	fileDeletions, dirDeletions, err := f.processNeeded(ctx, dbUpdateChan, copyChan, scanChan)
+	fileDeletions, dirDeletions, err := f.processNeededByHash(ctx, dbUpdateChan, copyChan, scanChan)
 
 	// Signal copy and puller routines that we are done with the in data for
 	// this iteration. Wait for them to finish.
