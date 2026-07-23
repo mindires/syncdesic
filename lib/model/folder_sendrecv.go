@@ -133,6 +133,139 @@ type sendReceiveFolder struct {
 	tempPullErrors map[string]string // pull errors that might be just transient
 }
 
+// processNeededByHash dispatches needed files using the 1+N query approach:
+//
+//  1. AllNeededGlobalFiles (1 SQL) — full FileInfo for routing decisions
+//  2. GetDeviceFile (1 SQL per file, N total) — local version comparison
+//
+// Unlike processNeeded, it dispatches files directly to handleFile/copyChan
+// without the intermediate queue.Push → GetGlobalFile → fileAvailability
+// pipeline. This reduces SQL queries from 1+3N to 1+N while preserving
+// version management compatibility.
+func (f *sendReceiveFolder) processNeededByHash(ctx context.Context, dbUpdateChan chan<- dbUpdateJob, copyChan chan<- copyBlocksState, scanChan chan<- string) (map[string]protocol.FileInfo, []protocol.FileInfo, error) {
+	var dirDeletions []protocol.FileInfo
+	fileDeletions := map[string]protocol.FileInfo{}
+	buckets := map[string][]protocol.FileInfo{}
+
+loop:
+	for file, err := range itererr.Zip(f.model.sdb.AllNeededGlobalFiles(f.folderID, protocol.LocalDeviceID, f.Order, 0, 0)) {
+		if err != nil {
+			return nil, nil, err
+		}
+		select {
+		case <-ctx.Done():
+			break loop
+		default:
+		}
+
+		if f.IgnoreDelete && file.IsDeleted() {
+			f.sl.DebugContext(ctx, "Ignoring file deletion per config", slogutil.FilePath(file.FileName()))
+			continue
+		}
+
+		switch {
+		case f.ignores.Match(file.Name).IsIgnored():
+			file.SetIgnored()
+			f.sl.DebugContext(ctx, "Handling ignored file", file.LogAttr())
+			dbUpdateChan <- dbUpdateJob{file, dbUpdateInvalidate}
+
+		case build.IsWindows && fs.WindowsInvalidFilename(file.Name) != nil:
+			if file.IsDeleted() {
+				dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
+			} else {
+				f.newPullError(file.Name, fs.WindowsInvalidFilename(file.Name))
+			}
+
+		case file.IsDeleted():
+			switch {
+			case file.IsDirectory():
+				dirDeletions = append(dirDeletions, file)
+			case file.IsSymlink():
+				f.deleteFile(file, dbUpdateChan, scanChan)
+			default:
+				df, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
+				if err != nil {
+					return nil, nil, err
+				}
+				if ok && !df.IsDeleted() && !df.IsSymlink() && !df.IsDirectory() && !df.IsInvalid() {
+					fileDeletions[file.Name] = file
+					key := string(df.BlocksHash)
+					buckets[key] = append(buckets[key], df)
+				} else {
+					f.deleteFileWithCurrent(file, df, ok, dbUpdateChan, scanChan)
+				}
+			}
+
+		case file.Type == protocol.FileInfoTypeFile:
+			curFile, hasCurFile, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
+			if err != nil {
+				return nil, nil, err
+			}
+			if hasCurFile && curFile.Type == file.Type && file.BlocksEqual(curFile) {
+				f.shortcutFile(file, dbUpdateChan)
+			} else {
+				// Dispatch directly to handleFile without queue.
+				// GetGlobalFile and fileAvailability are deferred:
+				//   - fileAvailability is rechecked inside pullBlock anyway
+				//   - handleFile uses the full FileInfo already in hand
+				if err := f.handleFile(ctx, file, copyChan); err != nil {
+					f.newPullError(file.Name, err)
+				}
+			}
+
+		case (build.IsWindows || build.IsAndroid) && file.IsSymlink():
+			if err := f.handleSymlinkCheckExisting(file, scanChan); err != nil {
+				f.newPullError(file.Name, fmt.Errorf("handling unsupported symlink: %w", err))
+				break
+			}
+			file.SetUnsupported()
+			f.sl.DebugContext(ctx, "Invalidating unsupported symlink", slogutil.FilePath(file.Name))
+			dbUpdateChan <- dbUpdateJob{file, dbUpdateInvalidate}
+
+		case file.IsDirectory() && !file.IsSymlink():
+			f.sl.DebugContext(ctx, "Handling directory", slogutil.FilePath(file.Name))
+			if f.checkParent(file.Name, scanChan) {
+				f.handleDir(file, dbUpdateChan, scanChan)
+			}
+
+		case file.IsSymlink():
+			f.sl.DebugContext(ctx, "Handling symlink", slogutil.FilePath(file.Name))
+			if f.checkParent(file.Name, scanChan) {
+				f.handleSymlink(file, dbUpdateChan, scanChan)
+			}
+
+		default:
+			panic("unhandleable item type, can't happen")
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	default:
+	}
+
+	// Attempt rename optimization for deletion-then-recreate patterns.
+	// This mirrors the queue-based rename in processNeeded but operates
+	// in-pass since we don't have a separate pop phase.
+	if len(fileDeletions) > 0 {
+		for name := range fileDeletions {
+			key := string(fileDeletions[name].BlocksHash)
+			for candidate, ok := popCandidate(buckets, key); ok; candidate, ok = popCandidate(buckets, key) {
+				desired := fileDeletions[candidate.Name]
+				if err := f.renameFile(candidate, desired, fileDeletions[name], dbUpdateChan, scanChan); err != nil {
+					f.sl.DebugContext(ctx, "Rename shortcut failed", slogutil.FilePath(name), slogutil.Error(err))
+					continue
+				}
+				delete(fileDeletions, candidate.Name)
+				break
+			}
+		}
+	}
+
+	return fileDeletions, dirDeletions, nil
+}
+
 func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger, ioLimiter *semaphore.Semaphore) service {
 	f := &sendReceiveFolder{
 		folder:             newFolder(model, ignores, cfg, evLogger, ioLimiter, ver),
