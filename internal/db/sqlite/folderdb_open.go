@@ -20,6 +20,7 @@ type folderDB struct {
 
 	localDeviceIdx  int64
 	deleteRetention time.Duration
+	blockCache      *blockCache
 }
 
 func openFolderDB(folder, path string, deleteRetention time.Duration) (*folderDB, error) {
@@ -47,6 +48,7 @@ func openFolderDB(folder, path string, deleteRetention time.Duration) (*folderDB
 		folderID:        folder,
 		baseDB:          base,
 		deleteRetention: deleteRetention,
+		blockCache:      newBlockCache(100000),
 	}
 
 	_ = fdb.PutKV("folderID", []byte(folder))
@@ -84,6 +86,7 @@ func openFolderDBForMigration(folder, path string, deleteRetention time.Duration
 		folderID:        folder,
 		baseDB:          base,
 		deleteRetention: deleteRetention,
+		blockCache:      newBlockCache(100000),
 	}
 
 	// Touch device IDs that should always exist and have a low index

@@ -1094,7 +1094,7 @@ func TestBlocklistGarbageCollection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// There should exist three blockslists and six blocks
+	// There should exist three blocklists (blocks table is cache-only, always empty)
 
 	fdb, err := sdb.getFolderDB(folderID, false)
 	if err != nil {
@@ -1112,9 +1112,9 @@ func TestBlocklistGarbageCollection(t *testing.T) {
 	if err := fdb.sql.Get(&count, `SELECT count(*) FROM blocks`); err != nil {
 		t.Fatal(err)
 	}
-	if count != 6 {
+	if count != 0 {
 		t.Log(count)
-		t.Fatal("expected 6 blocks")
+		t.Fatal("expected 0 blocks (cache-only)")
 	}
 
 	// Mark test3 as deleted, it's blocks and blocklist are now eligible for collection
@@ -1129,7 +1129,7 @@ func TestBlocklistGarbageCollection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// There should exist two blockslists and four blocks
+	// There should exist two blocklists (blocks table is cache-only, always empty)
 
 	if err := fdb.sql.Get(&count, `SELECT count(*) FROM blocklists`); err != nil {
 		t.Fatal(err)
@@ -1141,9 +1141,9 @@ func TestBlocklistGarbageCollection(t *testing.T) {
 	if err := fdb.sql.Get(&count, `SELECT count(*) FROM blocks`); err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 {
+	if count != 0 {
 		t.Log(count)
-		t.Error("expected 3 blocks")
+		t.Error("expected 0 blocks (cache-only)")
 	}
 }
 

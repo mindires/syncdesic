@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -103,15 +104,13 @@ func (s *folderDB) AllLocalFilesWithBlocksHash(h []byte) (iter.Seq[db.FileMetada
 }
 
 func (s *folderDB) AllLocalBlocksWithHash(hash []byte) (iter.Seq[db.BlockMapEntry], func() error) {
-	// We involve the files table in this select because deletion of blocks
-	// & blocklists is deferred (garbage collected) while the files list is
-	// not. This filters out blocks that are in fact deleted.
-	return iterStructs[db.BlockMapEntry](s.stmt(`
-		SELECT f.blocklist_hash as blocklisthash, b.idx as blockindex, b.offset, b.size, n.name as filename FROM files f
-		INNER JOIN file_names n ON f.name_idx = n.idx
-		LEFT JOIN blocks b ON f.blocklist_hash = b.blocklist_hash
-		WHERE f.device_idx = {{.LocalDeviceIdx}} AND b.hash = ?
-	`).Queryx(hash))
+	var h [32]byte
+	copy(h[:], hash)
+	locs, ok := s.blockCache.get(h)
+	if !ok {
+		return func(yield func(db.BlockMapEntry) bool) {}, func() error { return nil }
+	}
+	return slices.Values(locs), func() error { return nil }
 }
 
 func (s *folderDB) ListDevicesForFolder() ([]protocol.DeviceID, error) {

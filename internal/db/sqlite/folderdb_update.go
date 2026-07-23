@@ -148,11 +148,12 @@ func (s *folderDB) Update(device protocol.DeviceID, fs []protocol.FileInfo, opti
 			}
 			if _, err := insertBlockListStmt.Exec(f.BlocksHash, bs); err != nil {
 				return wrap(err, "insert blocklist")
-			} else if device == protocol.LocalDeviceID && !options.SkipBlockIndex {
-				// Insert all blocks
-				if err := s.insertBlocksLocked(txp, f.BlocksHash, f.Blocks); err != nil {
-					return wrap(err, "insert blocks")
-				}
+			}
+
+			// Syncdesic: cache-only block index — skip blocks table write,
+			// warm in-memory cache instead
+			if device == protocol.LocalDeviceID && !options.SkipBlockIndex {
+				s.blockCache.notify(f.Name, f.BlocksHash, f.Blocks)
 			}
 
 			f.Blocks = nil
@@ -320,6 +321,8 @@ func (s *folderDB) DropBlockIndex() error {
 	s.updateLock.Lock()
 	defer s.updateLock.Unlock()
 
+	s.blockCache.clear()
+
 	empty, err := s.blockIndexEmpty()
 	if err != nil || empty {
 		return err
@@ -341,17 +344,11 @@ func (s *folderDB) PopulateBlockIndex() error {
 		return err
 	}
 
-	tx, err := s.sql.BeginTxx(context.Background(), nil)
-	if err != nil {
-		return wrap(err)
-	}
-	defer tx.Rollback()
-	txp := &txPreparedStmts{Tx: tx}
-
-	// Iterate all local files that have a blocklist
-	rows, err := tx.Queryx(`
-		SELECT f.blocklist_hash, bl.blprotobuf FROM files f
+	// Syncdesic: don't write to blocks table — just warm the cache
+	rows, err := s.sql.Queryx(`
+		SELECT f.blocklist_hash, bl.blprotobuf, n.name FROM files f
 		INNER JOIN blocklists bl ON bl.blocklist_hash = f.blocklist_hash
+		INNER JOIN file_names n ON f.name_idx = n.idx
 		WHERE f.device_idx = ? AND f.blocklist_hash IS NOT NULL
 	`, s.localDeviceIdx)
 	if err != nil {
@@ -362,7 +359,8 @@ func (s *folderDB) PopulateBlockIndex() error {
 	for rows.Next() {
 		var blocklistHash []byte
 		var blProtobuf []byte
-		if err := rows.Scan(&blocklistHash, &blProtobuf); err != nil {
+		var name string
+		if err := rows.Scan(&blocklistHash, &blProtobuf, &name); err != nil {
 			return wrap(err)
 		}
 
@@ -376,15 +374,13 @@ func (s *folderDB) PopulateBlockIndex() error {
 			blocks[i] = protocol.BlockInfoFromWire(b)
 		}
 
-		if err := s.insertBlocksLocked(txp, blocklistHash, blocks); err != nil {
-			return wrap(err, "insert blocks")
-		}
+		s.blockCache.notify(name, blocklistHash, blocks)
 	}
 	if err := rows.Err(); err != nil {
 		return wrap(err)
 	}
 
-	return wrap(tx.Commit())
+	return nil
 }
 
 func (*folderDB) insertBlocksLocked(tx *txPreparedStmts, blocklistHash []byte, blocks []protocol.BlockInfo) error {
@@ -402,8 +398,6 @@ func (*folderDB) insertBlocksLocked(tx *txPreparedStmts, blocklistHash []byte, b
 		}
 	}
 
-	// Very large block lists (>8000 blocks) result in "too many variables"
-	// error. Chunk it to a reasonable size.
 	for chunk := range slices.Chunk(bs, 1000) {
 		if _, err := tx.NamedExec(`
 			INSERT OR IGNORE INTO blocks (hash, blocklist_hash, idx, offset, size)
@@ -412,9 +406,9 @@ func (*folderDB) insertBlocksLocked(tx *txPreparedStmts, blocklistHash []byte, b
 			return wrap(err)
 		}
 	}
+
 	return nil
 }
-
 func (s *folderDB) recalcGlobalForFolder(txp *txPreparedStmts) error {
 	// Select files where there is no global, those are the ones we need to
 	// recalculate.

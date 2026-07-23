@@ -7,6 +7,7 @@
 </linearGradient>
 </defs>
 <circle cx="256" cy="256" r="256" fill="url(#bg)"/>
+<g id="symbol">
 <line x1="256.00" y1="218.52" x2="372.91" y2="132.90" stroke="white" stroke-width="2" stroke-dasharray="12,8" stroke-linecap="round" opacity="0.67"/>
 <line x1="256.00" y1="218.52" x2="157.91" y2="114.37" stroke="white" stroke-width="2" stroke-dasharray="12,8" stroke-linecap="round" opacity="0.67"/>
 <line x1="256.00" y1="218.52" x2="139.09" y2="326.10" stroke="white" stroke-width="2" stroke-dasharray="12,8" stroke-linecap="round" opacity="0.67"/>
@@ -107,4 +108,5 @@
 <line x1="421.33" y1="119.38" x2="395.36" y2="126.63" stroke="white" stroke-width="10" stroke-linecap="round" opacity="0.25"/>
 <polygon points="396.22,129.71 421.33,119.38 394.50,123.55" fill="white"/>
 <circle cx="395.36" cy="126.63" r="3.2" fill="white"/>
+</g>
 </svg>
