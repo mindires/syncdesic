@@ -13,14 +13,20 @@ last_updated: "2026-07-23"
 
 ## 项目结构
 
-```
-syncdesic/
-├── ref/                    # 上游 syncthing submodule (v2.1.3-rc.1)
-├── lib/                    # 核心库（与上游共享 import path）
-├── internal/db/            # 数据库层（SQLite 后端）
-├── cmd/                    # 可执行文件入口
-├── .roo/rules/             # AI agent 规则
-└── go.mod                  # module github.com/syncthing/syncthing
+```mermaid
+flowchart LR
+    R["syncdesic/"] --> REF["ref/"]
+    R --> LIB["lib/"]
+    R --> IDB["internal/db/"]
+    R --> CMD["cmd/"]
+    R --> RR[".roo/rules/"]
+    R --> GM["go.mod"]
+    REF -.-> REFD["上游 syncthing submodule v2.1.3-rc.1"]
+    LIB -.-> LIBD["核心库（与上游共享 import path）"]
+    IDB -.-> IDBD["数据库层（SQLite 后端）"]
+    CMD -.-> CMDD["可执行文件入口"]
+    RR -.-> RRD["AI agent 规则"]
+    GM -.-> GMD["module github.com/syncthing/syncthing"]
 ```
 
 - GUD-001: `ref/` 是上游 submodule，**不得直接修改**。所有定制在 `ref/` 外实现。
@@ -76,6 +82,20 @@ go run build.go build syncthing -tags "mattn"
 ```
 
 > **Windows 已知问题**：`modernc.org/sqlite` 在无控制台环境（如 Tray 启动）下会 panic `"no console"`。解决方案是使用 `-tags "mattn"` 的 CGo 构建。需要安装 `gcc`（TDM-GCC/MinGW-w64）及 `pkg-config`。
+
+### 禁用自动更新
+
+Syncdesic 默认禁用自动更新，避免二进制被静默替换。可通过以下方式确保：
+
+```powershell
+# 编译时完全禁用（推荐）
+go run build.go build syncthing -tags "noupgrade"
+
+# 或运行时通过环境变量禁用
+$env:STNOUPGRADE=1; .\syncdesic.exe serve
+```
+
+> **说明**：`noupgrade` build tag 会设置 `upgrade.DisabledByCompilation = true`，完全移除自动升级逻辑。候选版本（`-rc.`）默认启用自动升级，Syncdesic 构建时应避免使用候选版本标签。
 
 ### 测试
 

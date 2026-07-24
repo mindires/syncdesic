@@ -14,8 +14,13 @@ Synctrain（[pixelspark/sushitrain](https://github.com/pixelspark/sushitrain)，
 
 Syncthing 的 `lib/fs` 包是装饰器模式的俄罗斯套娃：
 
-```
-caseFilesystem → mtimeFS → walkFilesystem → logFilesystem → metricsFS → BasicFilesystem
+```mermaid
+flowchart LR
+    CF["caseFilesystem"] --> MT["mtimeFS"]
+    MT --> WF["walkFilesystem"]
+    WF --> LF["logFilesystem"]
+    LF --> MF["metricsFS"]
+    MF --> BF["BasicFilesystem"]
 ```
 
 每层都是 VFS 包装。他写了一整台 VFS 机器。但他拒绝承认自己在做 VFS。

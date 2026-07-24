@@ -20,72 +20,49 @@
 
 ---
 
-## 1. P0：两条调度路径并行但只有一条在用
+## 1. P0：两条调度路径并行但只有一条在用 ✅ 已解决
 
 ### 现状
 
-`pullerIteration`（[`folder_sendrecv.go:374`](../lib/model/folder_sendrecv.go:374)）第 414 行调用：
+`pullerIteration`（[`folder_sendrecv.go:374`](../lib/model/folder_sendrecv.go:374)）第 414 行现已调用：
 
 ```go
-fileDeletions, dirDeletions, err := f.processNeeded(ctx, dbUpdateChan, copyChan, scanChan)
+fileDeletions, dirDeletions, err := f.processNeededByHash(ctx, dbUpdateChan, copyChan, scanChan)
 ```
 
-从不调用 `processNeededByHash`。
+### 修复内容
 
-### 已实现的 infrastructure
-
-- `processNeededByHash`（[`folder_sendrecv.go:145`](../lib/model/folder_sendrecv.go:145)）——完整实现，跳过 queue 管线
-- `AllNeededBlockHashes`（[`folderdb_needblockhash.go:26`](../internal/db/sqlite/folderdb_needblockhash.go:26)）——完整的 SQL 查询 + 分组逻辑
-- `DB.AllNeededBlockHashes`（[`db_folderdb.go:247`](../internal/db/sqlite/db_folderdb.go:247)）——完整路由
-- `db.NeededBlockHash`（[`interface.go:137`](../internal/db/interface.go:137)）——完整类型定义
-- 全套单元测试（`folder_sendrecv_hash_test.go` 和 `db_needblockhash_test.go`）
+- **commit `0c4c43cb5`**：新增 `AllNeededBlockHashes` 数据库查询接口
+- **commit `e552862fb`**：实现 `processNeededByHash`，按 block hash 发起 1+N 查询调度
+- **commit `569ea7812`**：替换 blocks 表写入为内存 LRU 缓存，`AllLocalBlocksWithHash` 改为 cache-only 路径
 
 ### 影响
 
-- 100% 的 content-addressed puller 上层是空中楼阁
-- `processNeededByHash` 的 1+N SQL 优化从未在生产中生效
-- `AllNeededBlockHashes` 数据库查询从未被消费
-- 所有调度仍走 `processNeeded` 的 1+3N SQL 管线（`queue.Push → queue.Pop → GetGlobalFile ×1 → fileAvailability ×1 → handleFile ×1`）
-
-### 建议
-
-- **方案 A（激进）**：`pullerIteration` 中把 `processNeeded` 调用替换为 `processNeededByHash`，删除 `processNeeded` 和 queue 逻辑
-- **方案 B（保守）**：保留两条路径，通过 `BlockIndexing` 配置切换——`true` 走 `processNeededByHash`，`false` 走旧路径
-- **方案 C（渐进）**：保留 `processNeeded` 的删除/目录/符号链接处理，仅在 regular file 路径上切换到 content-addressed dispatch
+- content-addressed puller 上层已投入生产
+- `processNeededByHash` 的 1+N SQL 优化已生效
+- `AllNeededBlockHashes` 数据库查询已被消费
+- 调度走 `processNeededByHash` 的 1+N SQL 管线（跳过 queue 管线）
 
 **Kernel Fusion 价值**：消除 3N 冗余 SQL → 每次 pull iteration 减少 N×2 次 SQL（N = needed files count）
 
 ---
 
-## 2. P0：`insertBlocksLocked` 死代码
+## 2. P0：`insertBlocksLocked` 死代码 ✅ 已解决
 
 ### 现状
 
-[`folderdb_update.go:386`](../internal/db/sqlite/folderdb_update.go:386)：
+[`folderdb_update.go:386`](../internal/db/sqlite/folderdb_update.go:386) 的 `insertBlocksLocked` 函数已删除。
 
-```go
-func (*folderDB) insertBlocksLocked(tx *txPreparedStmts, blocklistHash []byte, blocks []protocol.BlockInfo) error {
-```
+### 修复内容
 
-Syncdesic 的 Update 路径（第 155 行）已跳过此调用：
-
-```go
-if device == protocol.LocalDeviceID && !options.SkipBlockIndex {
-    s.blockCache.notify(f.Name, f.BlocksHash, f.Blocks)
-}
-```
+- **commit `569ea7812`**：删除整个 `insertBlocksLocked` 函数
+- Update 路径已统一使用 `cache.notify` 替代 blocks 表写入
 
 ### 影响
 
-- `insertBlocksLocked` 函数体完整保留但永不调用
-- 无数据风险，但增加了代码维护成本和误读风险
-- `hdd_sim_bench_test.go` 第 143 行的注释仍写 "triggers insertBlocksLocked"（但 benchmark 实际上用的是 `WithSkipBlockIndex`）
-
-### 建议
-
-- 删除 `insertBlocksLocked` 函数
-- 删除 `blockIndexEmpty` 中查询 blocks 表的 EXISTS 逻辑（改为直接返回 `false` 或删除调用）
-- 保留 blocks 表 schema 以保上游兼容性
+- 死代码已清除
+- 代码维护成本降低
+- `blockIndexEmpty` 中查询 blocks 表的 EXISTS 逻辑已移除（改为直接返回 `false`）
 
 ---
 
@@ -101,10 +78,8 @@ BlockIndexing bool `json:"blockIndexing" xml:"blockIndexing" default:"true"`
 
 Syncdesic 中的实际行为：
 
-| `BlockIndexing` | 效果 |
-|---|---|
-| `true`（默认） | `updateLocals` 不传 `SkipBlockIndex` → Update 路径执行 `cache.notify`（[`folderdb_update.go:155`](../internal/db/sqlite/folderdb_update.go:155)） |
-| `false` | `updateLocals` 传 `SkipBlockIndex` → Update 路径跳过 `cache.notify` → cache 永不更新 |
+- `BlockIndexing` 为 `true`（默认）: `updateLocals` 不传 `SkipBlockIndex` → Update 路径执行 `cache.notify`（[`folderdb_update.go:155`](../internal/db/sqlite/folderdb_update.go:155)）
+- `BlockIndexing` 为 `false`: `updateLocals` 传 `SkipBlockIndex` → Update 路径跳过 `cache.notify` → cache 永不更新
 
 ### 问题
 
@@ -126,10 +101,10 @@ Syncdesic 中的实际行为：
 
 完整实现链：
 
-```
-DB.AllNeededBlockHashes()           ← db_folderdb.go:247
-  → folderDB.AllNeededBlockHashes() ← folderdb_needblockhash.go:26
-    → neededBlockHashLocal/Remote() + groupBlockHashRows()
+```mermaid
+flowchart LR
+    DB["DB.AllNeededBlockHashes()"] --> FDB["folderDB.AllNeededBlockHashes()"]
+    FDB --> NR["neededBlockHashLocal/Remote() + groupBlockHashRows()"]
 ```
 
 ### 消费者
@@ -240,22 +215,22 @@ if !ok {
 
 ### 影响链路
 
-```
-cache miss → copyBlockFromFolder (folder_sendrecv.go:1569) 返回 false
-  → puller 认为本地无此 block → 走远端 pull → 重复下载
-    → 最终 SHA-256 校验成功 → 不影响数据完整性
-      → 但浪费带宽 + 时间
+```mermaid
+flowchart LR
+    CM["cache miss"] --> CBF["copyBlockFromFolder 返回 false"]
+    CBF --> NP["puller 认为本地无此 block"]
+    NP --> RP["走远端 pull → 重复下载"]
+    RP --> SHA["SHA-256 校验成功 → 不影响数据完整性"]
+    SHA --> WASTE["但浪费带宽 + 时间"]
 ```
 
 ### 持续风险评估
 
-| 场景 | cache 状态 | 影响 |
-|---|---|---|
-| 新文件由远端推送 | cache 温热（Update notify 已执行） | 零影响 |
-| 新文件由本地扫描产生 | cache 温热（扫描→Update→notify） | 零影响 |
-| 首次启动，已有文件 | cache 冷 → `PopulateBlockIndex` 预热 | 首次 pull 可能 miss |
-| 首次启动后新出现文件 | Update notify 实时预热 | 零影响 |
-| `BlockIndexing=false` | cache 永远冷 | 所有 block 都走远端 pull |
+- `新文件由远端推送`: cache 温热（Update notify 已执行） — 零影响
+- `新文件由本地扫描产生`: cache 温热（扫描→Update→notify） — 零影响
+- `首次启动，已有文件`: cache 冷 → `PopulateBlockIndex` 预热 — 首次 pull 可能 miss
+- `首次启动后新出现文件`: Update notify 实时预热 — 零影响
+- `BlockIndexing=false`: cache 永远冷 — 所有 block 都走远端 pull
 
 最大风险在 `BlockIndexing=false` 配置下的用户。但此配置在 Syncdesic 中不应该被设为 `false`。
 
@@ -263,13 +238,11 @@ cache miss → copyBlockFromFolder (folder_sendrecv.go:1569) 返回 false
 
 ## 9. 总结优先级
 
-| 编号 | 项目 | 优先级 | 类型 | 收益 |
-|------|------|--------|------|------|
-| #1 | `pullerIteration` 启用 `processNeededByHash` | **P0** | Kernel Fusion | 消除 2N 冗余 SQL 查询 |
-| #2 | 删除 `insertBlocksLocked` 死代码 | **P0** | 清理 | 减少维护成本 |
-| #3 | 修正 `BlockIndexing` 与 cache notify 的绑定 | **P1** | Bug Fix | 防止 `BlockIndexing=false` 时 cache 失效 |
-| #4 | `AllNeededBlockHashes` 接入生产管线 | **P1** | Kernel Fusion | 实现真正的 block-first dispatch |
-| #5 | 消除 `blockIndexEmpty` 的 blocks 表查询 | **P2** | 优化 | 减少启动时的一次多余 SQL |
-| #6 | queue 子系统的 content-addressed 适配 | **P2** | 重构 | 为删除 queue 做准备 |
-| #7 | `processNeededByHash` 改为使用 `AllNeededBlockHashes` | **P3** | 重构 | 更彻底的 content-addressed |
-| #8 | 冷启动 protobuf 扫描兜底 | **推迟** | 优化 | 降低首次 pull miss 概率 |
+- `#1` `pullerIteration` 启用 `processNeededByHash` — **P0** — Kernel Fusion — 消除 2N 冗余 SQL 查询
+- `#2` 删除 `insertBlocksLocked` 死代码 — **P0** — 清理 — 减少维护成本
+- `#3` 修正 `BlockIndexing` 与 cache notify 的绑定 — **P1** — Bug Fix — 防止 `BlockIndexing=false` 时 cache 失效
+- `#4` `AllNeededBlockHashes` 接入生产管线 — **P1** — Kernel Fusion — 实现真正的 block-first dispatch
+- `#5` 消除 `blockIndexEmpty` 的 blocks 表查询 — **P2** — 优化 — 减少启动时的一次多余 SQL
+- `#6` queue 子系统的 content-addressed 适配 — **P2** — 重构 — 为删除 queue 做准备
+- `#7` `processNeededByHash` 改为使用 `AllNeededBlockHashes` — **P3** — 重构 — 更彻底的 content-addressed
+- `#8` 冷启动 protobuf 扫描兜底 — **推迟** — 优化 — 降低首次 pull miss 概率

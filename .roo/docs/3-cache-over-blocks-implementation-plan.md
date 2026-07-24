@@ -97,11 +97,9 @@ type blockCache struct {
 
 ### 实现与计划的核心偏差
 
-| 项目 | 计划 (v4.0) | 实际实现 (v5.0) | 影响 |
-|------|-------------|-----------------|------|
-| 读路径 | cache → protobuf 扫描兜底 | cache-only（miss 返回空） | 冷启动首次查询无回退，需 Update 路径 notify 预热 |
-| `notify` 签名 | `notify(blocklistHash, blocks)` | `notify(name, blocklistHash, blocks)` | 增加 filename 参数用于 `byFile` 反向索引 |
-| `blockCache` 字段 | `byHash map[[32]byte]\*cacheEntry` + `lruList` + `lruMap` + `fileToHashes` | `byHash map[[32]byte]*list.Element` + `byFile map[string]map[[32]byte]struct{}` + `lru *list.List` | 更简洁：利用 list.Element 自带 Value，省去 lruMap 双重索引 |
+- `读路径`: 计划 (v4.0) cache → protobuf 扫描兜底 / 实际实现 (v5.0) cache-only（miss 返回空） — 影响：冷启动首次查询无回退，需 Update 路径 notify 预热
+- `notify` 签名: 计划 (v4.0) `notify(blocklistHash, blocks)` / 实际实现 (v5.0) `notify(name, blocklistHash, blocks)` — 影响：增加 filename 参数用于 `byFile` 反向索引
+- `blockCache` 字段: 计划 (v4.0) `byHash map[[32]byte]\*cacheEntry` + `lruList` + `lruMap` + `fileToHashes` / 实际实现 (v5.0) `byHash map[[32]byte]*list.Element` + `byFile map[string]map[[32]byte]struct{}` + `lru *list.List` — 影响：更简洁，利用 list.Element 自带 Value，省去 lruMap 双重索引
 
 ### 冷启动兜底缺失的风险评估
 
@@ -128,17 +126,17 @@ type blockCache struct {
 
 ## 性能
 
-- 写入 blocks 表: 上游 N 行 B-tree INSERT / Syncdesic 跳过(-100%)
-- cache notify: 上游 — / Syncdesic O(N) map insert(可忽略)
-- 读 cache 热: 上游 ~25ms / Syncdesic ~0ms map lookup(-25ms)
-- 读 cache 冷(首次): 上游 ~25ms / Syncdesic ~0ms 无 protobuf 扫描（但 hit 为 false）
-- DB 体积: blocks 表为空，显著减小
+- `写入 blocks 表`: 上游 N 行 B-tree INSERT / Syncdesic 跳过(-100%)
+- `cache notify`: 上游 — / Syncdesic O(N) map insert(可忽略)
+- `读 cache 热`: 上游 ~25ms / Syncdesic ~0ms map lookup(-25ms)
+- `读 cache 冷(首次)`: 上游 ~25ms / Syncdesic ~0ms 无 protobuf 扫描（但 hit 为 false）
+- `DB 体积`: blocks 表为空，显著减小
 
 ## 风险
 
-- 冷启动 cache miss 导致不必要的远端请求: 概率低，影响低 — 正常运行时 Update 路径持续预热 cache
-- cache OOM: 概率低，影响中 — LRU 100K(~20-40MB)
-- 上游因 blocks 空重建: 概率低 — 预期行为，自动从 blocklists 重建后 blocks 表为空
+- `冷启动 cache miss` 导致不必要的远端请求: 概率低，影响低 — 正常运行时 Update 路径持续预热 cache
+- `cache OOM`: 概率低，影响中 — LRU 100K(~20-40MB)
+- `上游因 blocks 空重建`: 概率低 — 预期行为，自动从 blocklists 重建后 blocks 表为空
 
 ## 上游参考
 
